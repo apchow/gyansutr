@@ -1,0 +1,10 @@
+streamlit
+chromadb
+pymupdf
+python-docx
+pytesseract
+pillow
+requests
+ollama
+numpy
+pytest
