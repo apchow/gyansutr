@@ -8,7 +8,8 @@ import requests
 from database import get_note, get_notes_list
 from embeddings import get_embedding
 from personas import get_persona
-from receipts import log_query, log_action
+from receipts import log_action, log_query
+from tool_schema import CREATE_FLASHCARD_DECK
 from vector_store import get_collection
 
 CHROMA_PATH = "./chroma_db"
@@ -27,7 +28,12 @@ def get_available_models():
 
 def query_llm(question, model_name, domain, collection=None):
     collection = collection or get_collection(CHROMA_PATH, COLLECTION_NAME)
-    query_emb = get_embedding(question)
+    try:
+        query_emb = get_embedding(question)
+    except requests.exceptions.RequestException:
+        answer = "Could not connect to Ollama embeddings (`nomic-embed-text`) at localhost:11434. Ensure Ollama is running and `nomic-embed-text` is pulled."
+        log_query(question=question, model=model_name, retrieved_chunk_ids=[], cited_answer_preview=answer)
+        return answer, [], []
 
     results = collection.query(query_embeddings=[query_emb], n_results=5)
     documents = results["documents"][0] if results.get("documents") and results["documents"] else []
@@ -66,12 +72,13 @@ def query_llm(question, model_name, domain, collection=None):
         answer = "Could not connect to Ollama at localhost:11434. Start Ollama and try again."
     except requests.exceptions.RequestException:
         answer = "Ollama could not complete this request. Please try again."
-    # Check for tool call
+
+    # Check for deterministic tool call
     tool_call = try_parse_tool_call(answer)
-    if tool_call and tool_call.get("tool") == "create_flashcard_deck":
-        result = execute_create_flashcard_deck(tool_call["args"], model_name)
+    if tool_call and tool_call.get("tool") == CREATE_FLASHCARD_DECK["name"]:
+        result = execute_create_flashcard_deck(tool_call.get("args", {}), model_name)
         log_query(question=question, model=model_name, retrieved_chunk_ids=chunk_ids, cited_answer_preview=result["user_message"][:500])
-        log_action(tool="create_flashcard_deck", status=result["status"], details=result["user_message"])
+        log_action(tool=CREATE_FLASHCARD_DECK["name"], status=result["status"], details=result["user_message"])
         return result["user_message"], sources, chunk_ids
 
     log_query(question=question, model=model_name, retrieved_chunk_ids=chunk_ids, cited_answer_preview=answer[:500])
@@ -79,11 +86,11 @@ def query_llm(question, model_name, domain, collection=None):
 
 
 def try_parse_tool_call(text: str):
-    """Extract JSON tool call from LLM output. Returns None if not a tool call."""
+    """Extract and validate JSON tool call from LLM output. Returns None if not a valid tool call."""
     cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
     try:
         obj = json.loads(cleaned)
-        if isinstance(obj, dict) and obj.get("tool"):
+        if isinstance(obj, dict) and obj.get("tool") == CREATE_FLASHCARD_DECK["name"] and isinstance(obj.get("args"), dict):
             return obj
     except json.JSONDecodeError:
         pass
@@ -92,9 +99,18 @@ def try_parse_tool_call(text: str):
 
 def execute_create_flashcard_deck(args: dict, model_name: str):
     """Validate and execute the create_flashcard_deck tool call deterministically."""
-    source = args.get("source_note", "").strip()
-    deck_name = args.get("deck_name", "Flashcards").strip()
-    count = min(int(args.get("card_count", 10)), 30)
+    source = str(args.get("source_note", "")).strip()
+    deck_name = str(args.get("deck_name", "Flashcards")).strip() or "Flashcards"
+    try:
+        count = max(1, min(int(args.get("card_count") or 10), 30))
+    except (ValueError, TypeError):
+        count = 10
+
+    if not source:
+        return {
+            "status": "failed",
+            "user_message": "⚠️ Missing 'source_note' in tool call arguments. Tool call aborted.",
+        }
 
     # Find the note by title
     note = None
@@ -106,7 +122,7 @@ def execute_create_flashcard_deck(args: dict, model_name: str):
     if not note:
         return {
             "status": "failed",
-            "user_message": f"⚠️ Could not find '{source}' in your vault. Tool call aborted."
+            "user_message": f"⚠️ Could not find '{source}' in your vault. Tool call aborted.",
         }
 
     # Generate flashcards from the note content
@@ -131,58 +147,79 @@ Source: [Note: {filename}]
     except requests.exceptions.RequestException:
         return {
             "status": "failed",
-            "user_message": "⚠️ Could not connect to Ollama to generate flashcards. Try again."
+            "user_message": "⚠️ Could not connect to Ollama to generate flashcards. Try again.",
         }
 
     # Parse the cards
-    cards = _parse_cards(raw_output, "student", [])
+    cards = _parse_cards(raw_output, "student", [{"filename": filename, "page": "1", "chunk_id": f"n{note['id']}"}])
 
     if not cards:
         return {
             "status": "failed",
-            "user_message": "⚠️ The model did not produce parseable flashcards. Try again."
+            "user_message": "⚠️ The model did not produce parseable flashcards. Try again.",
         }
 
     # Write the deck to the vault
     os.makedirs("vault", exist_ok=True)
-    out_filename = f"{deck_name.replace(' ', '_')}_flashcards.md"
+    safe_deck = re.sub(r'[<>:"/\\|?*]+', "_", deck_name).strip(" .") or "Flashcards"
+    out_filename = f"{safe_deck.replace(' ', '_')}_flashcards.md"
     out_path = os.path.join("vault", out_filename)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(f"# {deck_name}\n\n")
         f.write(f"_Generated from: {note['title']}_\n\n")
         for i, card in enumerate(cards, 1):
-            f.write(f"## Card {i}\n**Q:** {card['front']}\n\n**A:** {card['back']}\n\n---\n\n")
+            f.write(f"## Card {i}\nQ:\n\nA:\n\n---\n\n")
 
     return {
         "status": "success",
-        "user_message": f"✅ Created **{out_filename}** with {len(cards)} flashcards in your Obsidian vault."
+        "user_message": f"✅ Created **{out_filename}** with {len(cards)} flashcards in your Obsidian vault.",
     }
 
 
 def _parse_cards(raw_output, domain, sources):
     cards = []
     for block in re.split(r"\n\s*---+\s*\n", raw_output):
+        if not block.strip():
+            continue
         source_match = re.search(r"(?:Source|Sources)\s*:\s*\[(\d+)\]", block, re.IGNORECASE)
         source_index = int(source_match.group(1)) - 1 if source_match else 0
-        source = sources[source_index] if 0 <= source_index < len(sources) else None
+        source = sources[source_index] if 0 <= source_index < len(sources) else (sources[0] if sources else None)
 
         if "student" in domain.lower():
             front_match = re.search(r"\*\*Q:\s*(.+?)\*\*", block, re.IGNORECASE | re.DOTALL)
             if not front_match:
-                front_match = re.search(r"(?:^|\n)Q:\s*(.+?)(?=\n)", block, re.IGNORECASE)
-            back_match = re.search(r"(?:^|\n)A:\s*(.+?)(?=\n\s*(?:Source\s*:|$))", block, re.IGNORECASE | re.DOTALL)
+                front_match = re.search(r"(?:^|\n)\*{0,2}Q:\*{0,2}\s*(.+?)(?:\*{2})?(?=\n)", block, re.IGNORECASE)
+            back_match = re.search(
+                r"(?:^|\n)\*{0,2}A:\*{0,2}\s*(.+?)(?=\n\s*(?:\*{0,2}Source|\*{0,2}Sources|$))",
+                block,
+                re.IGNORECASE | re.DOTALL,
+            )
             if front_match and back_match:
-                cards.append({"front": front_match.group(1).strip(), "back": back_match.group(1).strip(), "source": source})
+                cards.append({
+                    "front": front_match.group(1).strip().strip("*").strip(),
+                    "back": back_match.group(1).strip().strip("*").strip(),
+                    "source": source,
+                })
         else:
-            headline_match = re.search(r"(?:📰\s*)?HEADLINE:\s*(.+?)(?=\n|$)", block, re.IGNORECASE)
+            headline_match = re.search(r"(?:📰\s*)?\*{0,2}HEADLINE:\*{0,2}\s*(.+?)(?=\n|$)", block, re.IGNORECASE)
             if headline_match:
-                cards.append({"front": headline_match.group(1).strip(), "back": "", "source": source})
+                cards.append({"front": headline_match.group(1).strip().strip("*").strip(), "back": "", "source": source})
     return cards
 
 
 def generate_flashcards(topic, model_name, domain, collection=None):
     collection = collection or get_collection(CHROMA_PATH, COLLECTION_NAME)
-    query_emb = get_embedding(topic)
+    try:
+        query_emb = get_embedding(topic)
+    except requests.exceptions.RequestException:
+        raw_output = "Could not connect to Ollama embeddings (`nomic-embed-text`) at localhost:11434."
+        return {
+            "preview_id": str(uuid.uuid4()),
+            "cards": [],
+            "sources": [],
+            "raw_model_output": raw_output,
+            "retrieved_chunk_ids": [],
+        }
 
     results = collection.query(query_embeddings=[query_emb], n_results=5)
     documents = results["documents"][0] if results.get("documents") and results["documents"] else []
@@ -213,18 +250,22 @@ def generate_flashcards(topic, model_name, domain, collection=None):
     rules = (
         "Generate exactly 5 concise Q&A pairs based ONLY on the context. For each, cite one context source. "
         "Format each exactly as:\n**Q: [Question]**\nA: [Answer]\nSource: [1]\n---"
-        if "Student" in domain
+        if "student" in domain.lower()
         else "Generate exactly 5 headlines (max 12 words each) based ONLY on the context. Cite one source per headline. "
         "Format each exactly as:\n📰 HEADLINE: [text]\nSource: [1]\n---"
     )
 
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={"model": model_name, "prompt": f"{rules}\n\nContext:\n{context}", "stream": False},
-        timeout=120,
-    )
-    response.raise_for_status()
-    raw_output = response.json().get("response", "Failed to generate.")
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model_name, "prompt": f"{rules}\n\nContext:\n{context}", "stream": False},
+            timeout=120,
+        )
+        response.raise_for_status()
+        raw_output = response.json().get("response", "Failed to generate.")
+    except requests.exceptions.RequestException as err:
+        raw_output = f"Ollama connection error while generating cards: {err}"
+
     preview = {
         "preview_id": str(uuid.uuid4()),
         "cards": _parse_cards(raw_output, domain, sources),

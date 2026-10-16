@@ -9,7 +9,6 @@ try:
     try:
         _md.version("streamlit")
     except PackageNotFoundError:
-        # If metadata wasn't bundled, force Streamlit to skip version check
         import types
         fake_dist = types.SimpleNamespace(version="1.64.0")
         _md.distribution = lambda name: fake_dist if name == "streamlit" else (_ for _ in ()).throw(PackageNotFoundError(name))
@@ -18,13 +17,16 @@ except Exception:
 
 import streamlit.web.cli as stcli
 
+
 def resolve_path(path):
     if getattr(sys, "_MEIPASS", False):
         return os.path.join(sys._MEIPASS, path)
     return os.path.join(os.path.abspath(os.path.dirname(__file__)), path)
 
+
 if __name__ == "__main__":
-    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(".")
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.abspath(os.path.dirname(__file__))
+    os.chdir(base)
     os.makedirs(os.path.join(base, "workspace", "documents"), exist_ok=True)
     os.makedirs(os.path.join(base, "workspace", "receipts"), exist_ok=True)
     os.makedirs(os.path.join(base, "workspace", "cards"), exist_ok=True)
@@ -34,7 +36,7 @@ if __name__ == "__main__":
     sys.argv = [
         "streamlit", "run", resolve_path("app.py"),
         "--global.developmentMode=false",
-        "--server.headless=true",
+        "--server.headless=false",
         "--browser.gatherUsageStats=false",
     ]
     sys.exit(stcli.main())
